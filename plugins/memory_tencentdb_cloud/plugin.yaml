@@ -1,0 +1,5 @@
+name: memory_tencentdb_cloud
+display_name: TencentDB Agent Memory (Cloud)
+description: TencentDB Agent Memory cloud instance integration (v3 data plane, L0 capture / L1+L3 recall / search tools)
+aliases:
+  - tdai-cloud
