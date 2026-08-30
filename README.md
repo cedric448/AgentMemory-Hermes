@@ -48,6 +48,9 @@ hermes -z "我的幸运数字是多少?"
 │   ├── ARCHITECTURE.md      # 架构文档
 │   ├── OPERATIONS.md        # 操作文档(安装/配置/运维/排障)
 │   └── BENCHMARK.md         # 测试报告与基准数据
+├── tests/
+│   ├── four_assets_test.py  # 四资产能力测试(Chat Memory/Skill/Wiki/CodeGraph)
+│   └── memory_benchmark.py  # 记忆召回 benchmark(延迟/命中率/预算)
 └── plugins/memory_tencentdb_cloud/
     ├── __init__.py          # MemoryProvider 实现
     ├── client.py            # v3 数据面 HTTP 客户端
@@ -56,7 +59,9 @@ hermes -z "我的幸运数字是多少?"
 
 ## 免费版实例已知限制
 
-- L1/L2/L3 提炼管线(结构化记忆、场景块、画像)实测不产出,仅 L0 对话检索有效
+- L1/L2/L3 提炼管线(结构化记忆、场景块、画像)实测不产出,仅 L0 对话检索有效;L3 核心记忆可通过 `/v3/core/write` 手动维护
 - 检索索引异步,写入后约 **2~3 分钟**才可检索
 - 不要对活跃隔离维度批量删除会话(会导致搜索索引失效)
 - 实例负载高时偶发 522/高延迟,插件已做超时与降级处理
+- Skill 资产需先在元数据面(`/v3/meta/*`)注册 team/agent;详见 `docs/BENCHMARK.md` §1
+- Wiki/CodeGraph 免费版仅开放元数据 CRUD,内容检索/图查询需自建 Knowledge Service

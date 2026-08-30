@@ -1,125 +1,153 @@
 # 测试报告与 Benchmark
 
-> 测试日期:2026-08-30
+> 测试日期:2026-08-30(两轮:初版插件 + 四资产扩展)
 > 环境:2 台 TencentOS 4 服务器(腾讯云,Python 3.11.6,Hermes Agent 0.19.0)
-> 被测实例:TencentDB Agent Memory 免费版(广州区)
+> 被测实例:TencentDB Agent Memory **免费版**(广州区)
 > 模型:glm-5.3(经 OpenAI 兼容网关)
-> 数据版本:插件 v1.0(含并行 prefetch / 短超时 / 退出兜底 flush)
+> 测试脚本:`tests/four_assets_test.py`(四资产能力)、`tests/memory_benchmark.py`(记忆 benchmark)
 
-## 1. 测试结论速览
+## 1. 四资产能力测试(免费版数据面)
 
-| # | 测试项 | 结果 |
-|---|--------|------|
-| 1 | 云实例连通性与鉴权 | ✅ |
-| 2 | L0 对话上报(capture) | ✅ |
-| 3 | L0 检索召回(单机,新会话) | ✅ |
-| 4 | 跨机记忆召回(A 机写入 → B 机召回) | ✅ |
-| 5 | 搜索工具(tdai_*_search) | ✅ |
-| 6 | L1 结构化记忆抽取 | ⚠️ 免费版不产出 |
-| 7 | prefetch 性能 | ✅ 常态 <4s,受实例负载影响 |
-| 8 | 索引生效延迟 | ⚠️ 2~3 分钟 |
-| 9 | 批量删除安全性 | ❌ 实测导致索引失效 |
+官方"四资产"(Chat Memory / Skill / Wiki / CodeGraph)的注入链路走代理服务,
+免费版不可用(code 5901)。本测试验证的是**数据面直接访问**的真实可用性,
+测试脚本见 `tests/four_assets_test.py`(可重复执行,自动创建/清理测试资产)。
 
-## 2. 端到端功能测试
+最终结果汇总(2026-08-30 实测):
+
+| 资产 | 能力 | 数据面接口 | 免费版结果 |
+|------|------|-----------|-----------|
+| **Chat Memory** | L0 对话写入/查询/检索 | `/v3/conversation/add·query·search` | ✅ 全部可用 |
+| Chat Memory | L3 核心记忆写/读 | `/v3/core/write·read` | ✅ 可用(手动维护) |
+| Chat Memory | L1 结构化记忆抽取 | `/v3/atomic/search·query` | ⚠️ 接口可用,管线不产出 |
+| Chat Memory | L2 场景块 | `/v3/scenario/ls·read·write` | ⚠️ 只能列举;write 不能创建文件(404) |
+| Chat Memory | 上下文 offload | `/v3/offload/*` | ❌ 未路由(404) |
+| **Skill** | 全生命周期 CRUD | `/v3/skill/create·get·get-by-name·list·search·files/*·delete` | ✅ **16 项接口全部可用** |
+| **Wiki** | 元数据 CRUD | `/v3/knowledge/create·get·list·update·delete` (type=wiki) | ✅ 可用(仅元数据) |
+| Wiki | 内容检索/页面读取 | Knowledge Service 数据面 | ❌ 需自建 :8421(免费版不含) |
+| **CodeGraph** | 元数据 CRUD | `/v3/knowledge/*` (type=code-graph) | ✅ 可用(仅元数据) |
+| CodeGraph | 图查询 | Knowledge Service 数据面 | ❌ 需自建 :8421(免费版不含) |
+
+测试执行明细(最后一轮完整跑通的部分,每项含延迟):
+
+```
+Setup         team/agent provisioning           PASS
+ChatMemory    L0 conversation/add               PASS
+ChatMemory    L0 conversation/query             PASS
+ChatMemory    L0 conversation/search            PASS  (索引异步)
+ChatMemory    L3 core/write / core/read         PASS
+ChatMemory    L1 atomic/search                  PASS  (items=0,免费版管线不产出)
+ChatMemory    L2 scenario/ls                    PASS
+ChatMemory    L2 scenario/write(创建)           N/A   404 file not found
+ChatMemory    offload/ingest                    N/A   404 未路由
+Skill         create / get / get-by-name        PASS  (skill_id=skl-…)
+Skill         files/write / files/read          PASS
+Skill         search / list / delete            PASS  (search 同步命中)
+Wiki          knowledge/create·get·list·delete  PASS
+Wiki          内容检索                          N/A   需 Knowledge Service
+CodeGraph     knowledge/create·get·list·delete  PASS
+CodeGraph     图查询                            N/A   需 Knowledge Service
+```
+
+### Skill 资产的关键前置条件(重要发现)
+
+`skill/create` 要求 agent 已在**元数据面**注册,否则报
+`50001 agent_not_found`。元数据面接口(`/v3/meta/*`)以 `x-tdai-user-key`
+鉴权,实例 API Key 即 system_admin 身份,可直接:
+
+```
+POST /v3/meta/user/list            → 拿到 owner user_id(usr-…)
+POST /v3/meta/team/create          → ⚠️ 服务端自动分配 team_id(自定义 ID 会被当 name)
+POST /v3/meta/agent/create         → ⚠️ 同样自动分配 agt-… ID
+```
+
+之后 Skill 请求必须携带**服务端分配的** `team_id`(team-…)/`agent_id`(agt-…)。
+其它易错点:
+- skill `content` 必须带 YAML frontmatter(`---\nname: …\ndescription: …\n---`),否则 `42203`
+- `get-by-name` 的字段名是 `skill_name` 而非 `name`(40001 zod 校验)
+- `files/write` 的 `files[].encoding` 必填(`"utf-8"`);`files/read` 用单数 `path`
+- knowledge `get/delete` 的 team_id 必须与实体归属一致,否则 403 team_id mismatch
+
+## 2. Chat Memory benchmark
 
 ### 2.1 写入 → 单机新会话召回
 
 ```
-会话 A: hermes -z "我叫张伟,我最喜欢的编程语言是 Rust,请记住这个偏好"
-会话 B: hermes -z "我最喜欢什么编程语言?如果不确定就说不确定"
+会话 A: hermes -z "我叫张伟,我最喜欢的编程语言是 Rust,请记住"
+会话 B: hermes -z "我最喜欢什么编程语言?"
 结果  : "根据我的记录,你最喜欢的编程语言是 Rust。"        ✅ PASS
 ```
 
-### 2.2 跨机召回(核心场景)
+### 2.2 跨机召回(核心场景,两轮验证均 PASS)
 
 ```
-A 机:  hermes -z "我的幸运数字是 73,请记住"   → 回复"已记住"
+A 机:  hermes -z "我的幸运数字是 73,请记住"   → "已记住"
        (等待约 2.5 分钟索引生效)
 B 机:  hermes -z "我的幸运数字是多少?请直接给出数字"
 结果  : "73"                                    ✅ PASS
+复测  : hermes -z "请记住:我的高铁会员号是 G888888" → 跨机召回验证通过
 ```
 
-B 机的召回路径:`prefetch("我的幸运数字是多少?…")` → 云端 L0 search 命中
-A 机写入的对话 → `<related_conversations>` 注入 → 模型作答。
+### 2.3 性能数据(2026-08-30,`tests/memory_benchmark.py --runs 6`)
 
-### 2.3 搜索工具
+两种实例负载状态下的对比:
 
-```
-tdai_conversation_search("幸运数字")
-→ {"items": […命中 A 机写入的消息…], "total": n}   ✅ PASS
-```
-
-### 2.4 L1 结构化记忆抽取
-
-```
-写入多轮对话后查询 /v3/atomic/query
-→ items 始终为空(观察窗口 >30 分钟)             ⚠️ 免费版限制
-```
-
-免费版实例的 L1/L2/L3 异步提炼管线不产出,当前召回全部依赖 L0 检索。
-升级付费版后此层应自动生效(插件无需改动)。
-
-## 3. 性能 Benchmark
-
-### 3.1 prefetch 耗时(3 路并行:L3+L1+L0,注入完整时 len≈600 字符)
-
-| 时段 | 耗时 | 说明 |
+| 指标 | 空闲时段 | 高负载时段(522 频发) |
 |---|---|---|
-| 实例空闲 | 0.35s | 全部命中 |
-| 常规 | 2.8s ~ 4.1s | 三路并行,单请求 <3.5s |
-| 实例高负载(522 频发) | 4~8s | 部分请求超时,优雅降级(可能只返回部分 section) |
-| 修复前(串行,无超时控制) | 最坏 36s | 被 MemoryManager 8s 预算跳过 → 召回丢失 |
+| L0 capture(写入) | <1s | median 3.7s / max 12.3s |
+| L0 search | <1s | median 3.9s / p95 6.5s / max 19.3s |
+| L3 core/read | <0.5s | median 0.9s / max 6.4s |
+| **prefetch 端到端** | **0.35~4.1s** | **median=max=6.50s(全部命中 deadline)** |
+| prefetch 超出 Hermes 8s 预算 | 0 | **0(6.5s deadline 生效)** |
+| prefetch 非空率 | 100% | 100% |
 
-> MemoryManager 对外部 provider prefetch 有 8s 硬预算,超过即整轮跳过。
-> 并行化 + 短超时修复后,prefetch 稳定压在预算内(最坏 6.5s deadline)。
+> 结论:并行化 + 5.5s 单请求超时 + 6.5s 总 deadline 后,即使实例高负载,
+> prefetch 也不会超出 MemoryManager 的 8s 预算,召回保持可用;
+> 代价是高负载时部分 section 可能被截断(优雅降级)。
 
-### 3.2 sync_turn(capture)
-
-| 指标 | 数值 |
-|---|---|
-| 对话轮次阻塞 | ≈0(仅入队) |
-| 上报延迟 | 后台异步,常 <2s 落库 |
-| 已知丢失窗口 | `hermes -z` 最后一轮偶发丢失(交互式不受影响) |
-
-### 3.3 云端检索索引生效延迟
+### 2.4 检索索引生效延迟
 
 | 实验 | 写入 → 可检索 |
 |---|---|
 | 第 1 组 | ≈2 分钟 |
 | 第 2 组 | 2.5~3 分钟 |
 | 第 3 组 | 100s |
+| 基准脚本写入 | ≈2 分钟 |
 
 结论:索引异步生效,**写入后立即提问检索不到属预期**,建议等待 2~3 分钟。
 
-### 3.4 官方记忆效果对照
+### 2.5 召回质量
 
 | 场景 | 无云端记忆 | 有云端记忆 |
 |---|---|---|
-| 新会话问个人事实(数字/偏好) | "不确定/没有记录" | 准确回答 |
+| 新会话问个人事实(数字/偏好/编号) | "不确定/没有记录" | 准确回答 |
 | 跨机器共享用户上下文 | 不可能 | 同四元组即可 |
+| 语义近似问法("幸运数字"→" lucky number") | — | L0 关键词检索依赖字面重叠,近似问法可能漏召回 |
 
-## 4. 稳定性/缺陷发现
-
-以下为本项目实测发现的问题,对使用同类架构的用户有参考价值:
+## 3. 稳定性/缺陷发现
 
 | # | 现象 | 根因 | 处置 |
 |---|---|---|---|
-| 1 | 免费版无法使用官方代理注入路由 | `code 5901: free edition instance is not allowed to access proxy service` | 改走 /v3 数据面(本插件) |
-| 2 | conversation/search 响应键是 `messages`,atomic/search 是 `items` | 两接口响应结构不一致 | 插件内 `_items()` 兼容两者 |
+| 1 | 免费版无法使用官方代理注入路由 | `code 5901` | 改走 /v3 数据面(本插件) |
+| 2 | conversation/search 响应键是 `messages`,atomic/search 是 `items` | 接口响应结构不一致 | 插件内 `_items()` 兼容两者 |
 | 3 | timestamp 拒绝 `+08:00` 格式 | 服务端仅接受 UTC `Z` | 插件统一用 `time.gmtime()` |
-| 4 | **批量删除会话后,该隔离维度新写入消息不再入检索索引**(query 可见、search 永久 0 命中) | 疑似免费版管线缺陷 | 换新 `user_id` 恢复;避免批量删除 |
-| 5 | 串行 prefetch 最坏 36s,超过 Hermes 8s 预算被静默跳过 | 云实例偶发 522/高延迟 | 三路并行 + 5.5s 单请求超时 + 6.5s 总 deadline |
-| 6 | daemon capture 线程在进程退出时可能丢尾部数据 | `-z` 模式退出路径不保证调用 shutdown() | shutdown() 同步兜底 drain 队列 |
-| 7 | 失败回答("没有记录")也会被 capture,污染后续检索排序 | L0 全量上报 | 召回 limit 提至 8;可考虑后续对 assistant 回复做过滤 |
+| 4 | **批量删除会话后,该隔离维度新写入消息不再入检索索引** | 疑似免费版管线缺陷 | 换新 `user_id` 恢复;避免批量删除 |
+| 5 | 串行 prefetch 最坏 36s,超出 Hermes 8s 预算被静默跳过 | 云实例偶发 522/高延迟 | 三路并行 + 5.5s 单请求超时 + 6.5s 总 deadline |
+| 6 | daemon capture 线程在进程退出时可能丢尾部数据 | `-z` 退出路径不保证调用 shutdown() | shutdown() 同步兜底 drain 队列 |
+| 7 | 失败回答("没有记录")也会被 capture,污染后续检索排序 | L0 全量上报 | 召回 limit 提至 8;可考虑对 assistant 回复过滤 |
+| 8 | skill/create 报 `50001 agent_not_found` | agent 未在元数据面注册 | 见 §1 的 meta 面预置流程 |
+| 9 | meta 面 team/agent create 不接受自定义 ID | 服务端自动分配 team-…/agt-… | create 后取返回 ID 使用 |
+| 10 | knowledge get/delete 报 403 team_id mismatch | 实体归属创建时的 team | 用创建时的 team_id 访问 |
 
-## 5. 测试环境复现
+## 4. 环境复现
 
 ```bash
 # 1. 两台机器安装
 pip install hermes-agent
 cp -r plugins/memory_tencentdb_cloud ~/.hermes/plugins/
 # 2. 按 docs/OPERATIONS.md §4 配置(两机同四元组)
-# 3. 跑 §2.2 跨机用例
+# 3. 四资产能力测试(自动建/清测试资产)
+python3 tests/four_assets_test.py
+# 4. 记忆 benchmark
+python3 tests/memory_benchmark.py --runs 6
+# 5. 跨机召回:两机分别执行 §2.2 的 A/B 步骤
 ```
-
-测试期间使用的关键命令(云端巡检)见 OPERATIONS.md §6。
