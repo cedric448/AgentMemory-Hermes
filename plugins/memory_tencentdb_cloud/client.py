@@ -98,6 +98,8 @@ class TDAMCloudClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: str = "",
+        timeout: Optional[int] = None,
+        retries: Optional[int] = None,
     ) -> Dict[str, Any]:
         """L0: append conversation messages."""
         body = {
@@ -105,6 +107,10 @@ class TDAMCloudClient:
             "session_id": session_id or "default",
             "messages": messages,
         }
+        if retries is not None:
+            return self._post("/v3/conversation/add", body, timeout=timeout, retries=retries)
+        if timeout is not None:
+            return self._post("/v3/conversation/add", body, timeout=timeout)
         return self._post("/v3/conversation/add", body)
 
     def conversation_search(self, query: str, *, limit: int = 5, session_id: str = "") -> Dict[str, Any]:

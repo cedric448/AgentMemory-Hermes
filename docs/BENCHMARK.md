@@ -143,6 +143,23 @@ capture 过滤:负样本轮次不入队(队列 0);正常轮次入队(队列 1)
 已知残留:用户侧的重复提问(非 assistant 回复)仍会 capture 并参与检索,
 暂无法与真实记忆区分;影响有限(问题本身不含答案信息)。
 
+### 2.7 `-z` 尾轮丢失修复验证(2026-08-31)
+
+根因:插件内自建的 queue+daemon worker 与 MemoryManager 的后台 sync 线程
+形成双重异步——`-z` 硬退出(`os._exit`)时,末轮 payload 可能尚未入队,
+或在途 POST 被 worker 连带杀死。
+
+修复:移除插件内第二层异步,`sync_turn` 直接同步上传(4s 超时,单次)。
+MemoryManager 在硬退出前会等待后台 sync 任务 ≤5s,同步上传在该窗口内
+天然完成,无竞态。
+
+```
+离线压测:3 轮连续 sync_turn + 立即 shutdown → 云端 6/6 条消息落库(修复前 4/6)
+真机验证:远端连续两次 hermes -z(RT1/RT2)→ 两次末轮均立即落库   ✅ PASS
+残余约束:实例单请求延迟 >5s 时,末轮可能被 MemoryManager 5s drain
+预算放弃(hermes 侧硬边界);常态 <1s 零丢失,上报失败会写错误日志
+```
+
 ## 3. 稳定性/缺陷发现
 
 | # | 现象 | 根因 | 处置 |
@@ -152,7 +169,7 @@ capture 过滤:负样本轮次不入队(队列 0);正常轮次入队(队列 1)
 | 3 | timestamp 拒绝 `+08:00` 格式 | 服务端仅接受 UTC `Z` | 插件统一用 `time.gmtime()` |
 | 4 | **批量删除会话后,该隔离维度新写入消息不再入检索索引** | 疑似免费版管线缺陷 | 换新 `user_id` 恢复;避免批量删除 |
 | 5 | 串行 prefetch 最坏 36s,超出 Hermes 8s 预算被静默跳过 | 云实例偶发 522/高延迟 | 三路并行 + 5.5s 单请求超时 + 6.5s 总 deadline |
-| 6 | daemon capture 线程在进程退出时可能丢尾部数据 | `-z` 退出路径不保证调用 shutdown() | shutdown() 同步兜底 drain 队列 |
+| 6 | daemon capture 线程在进程退出时可能丢尾部数据 | `-z` 退出路径不保证调用 shutdown() | ✅ **已修复**(2026-08-31):移除插件内第二层异步(queue+daemon worker),`sync_turn` 直接同步上传(4s 超时,单次)——MemoryManager 本身就在后台线程调 sync_turn 并在硬退出前有 ≤5s 的 executor drain,双重异步才是竞态根源。真机两轮连续 `-z` 末轮全部落库。**残余**:实例单请求延迟 >5s 时,末轮仍可能被 MemoryManager 的 drain 预算放弃(hermes 侧硬边界,常态 <1s 零丢失) |
 | 7 | 失败回答("没有记录")也会被 capture,污染后续检索排序 | L0 全量上报 | ✅ **已修复**(2026-08-30):双层过滤——capture 侧跳过"记忆未命中"类回复(`_is_negative_memory`,中英文模式,保守不误杀);召回侧从 prefetch/tool 结果中剔除该类条目并按内容去重。实测:污染条目从召回中消失,正确记忆重新浮出 |
 | 8 | skill/create 报 `50001 agent_not_found` | agent 未在元数据面注册 | 见 §1 的 meta 面预置流程 |
 | 9 | meta 面 team/agent create 不接受自定义 ID | 服务端自动分配 team-…/agt-… | create 后取返回 ID 使用 |

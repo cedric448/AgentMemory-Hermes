@@ -23,7 +23,6 @@ import os
 import re
 import threading
 import time
-from queue import Queue
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -79,8 +78,6 @@ class TencentdbCloudProvider(MemoryProvider):
     def __init__(self):
         self._client: Optional[TDAMCloudClient] = None
         self._session_id = ""
-        self._queue: "Queue[Optional[Dict[str, Any]]]" = Queue()
-        self._worker: Optional[threading.Thread] = None
         self._started = False
 
     # -- properties / availability -------------------------------------------
@@ -104,12 +101,7 @@ class TencentdbCloudProvider(MemoryProvider):
             agent_id=_env("TDAI_MEMORY_AGENT_ID", "agent-default"),
             user_id=_env("TDAI_MEMORY_USER_ID", "user-default"),
         )
-        if not self._started:
-            self._worker = threading.Thread(
-                target=self._capture_worker, daemon=True, name="tdam-capture"
-            )
-            self._worker.start()
-            self._started = True
+        self._started = True
         logger.info(
             "memory_tencentdb_cloud initialized: endpoint=%s service=%s session=%s",
             _env("TDAI_MEMORY_ENDPOINT"), _env("TDAI_MEMORY_INSTANCE_ID"), self._session_id,
@@ -119,25 +111,12 @@ class TencentdbCloudProvider(MemoryProvider):
         self._session_id = new_session_id or self._session_id
 
     def shutdown(self) -> None:
-        if self._started and self._worker is not None:
-            self._queue.put(None)  # sentinel
-            self._worker.join(timeout=2)
-            self._started = False
-        # Safety net: flush anything still queued synchronously (daemon
-        # threads can be killed abruptly on interpreter exit).
-        while True:
-            try:
-                payload = self._queue.get_nowait()
-            except Exception:
-                break
-            if payload is None or not self._client:
-                continue
-            try:
-                self._client.conversation_add(
-                    payload["messages"], session_id=payload["session_id"]
-                )
-            except Exception as e:
-                logger.warning("tdam-cloud shutdown flush failed: %s", e)
+        """No-op for uploads: sync_turn uploads inline, so by the time
+        MemoryManager tears providers down (after its ≤5s executor drain)
+        every completed turn is already persisted. Nothing left to flush.
+        (A daemon worker + queue design was tried and caused tail-turn
+        loss on hermes one-shot os._exit paths — do not reintroduce.)"""
+        self._started = False
 
     # -- recall ------------------------------------------------------------------
 
@@ -233,6 +212,14 @@ class TencentdbCloudProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
+        """Upload the turn synchronously (bounded ~4s).
+
+        MemoryManager already invokes sync_turn on its own serialized
+        background thread and waits for those tasks (≤5s) at shutdown
+        before hard-exiting one-shot runs — so uploading inline here is
+        race-free. A second async layer (internal queue + worker) was
+        tried and caused tail-turn loss on os._exit paths.
+        """
         if not self._client:
             return
         # Pollution guard: a "no record" reply carries nothing recallable and
@@ -242,29 +229,18 @@ class TencentdbCloudProvider(MemoryProvider):
             logger.info("tdam-cloud skip capture (memory-miss reply): %.80s", assistant_content)
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        payload = {
-            "session_id": session_id or self._session_id,
-            "messages": [
-                {"role": "user", "content": user_content, "timestamp": now},
-                {"role": "assistant", "content": assistant_content, "timestamp": now},
-            ],
-        }
-        self._queue.put(payload)
-
-    def _capture_worker(self) -> None:
-        while True:
-            payload = self._queue.get()
-            try:
-                if payload is None:
-                    return
-                try:
-                    self._client.conversation_add(
-                        payload["messages"], session_id=payload["session_id"]
-                    )
-                except Exception as e:
-                    logger.warning("tdam-cloud conversation_add failed: %s", e)
-            finally:
-                self._queue.task_done()
+        try:
+            self._client.conversation_add(
+                [
+                    {"role": "user", "content": user_content, "timestamp": now},
+                    {"role": "assistant", "content": assistant_content, "timestamp": now},
+                ],
+                session_id=session_id or self._session_id,
+                timeout=4,
+                retries=0,
+            )
+        except Exception as e:
+            logger.warning("tdam-cloud conversation_add failed: %s", e)
 
     # -- tools --------------------------------------------------------------------
 
