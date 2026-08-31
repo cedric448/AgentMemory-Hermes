@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from queue import Queue
@@ -31,6 +32,41 @@ from .client import TDAMCloudClient
 logger = logging.getLogger(__name__)
 
 # MemoryProvider literal required by the discovery text scan.
+
+# Turns whose assistant reply indicates a memory-lookup miss ("no record",
+# "不确定", "I don't know" ...) carry no recallable information and — because
+# they lexically overlap with the question — pollute L0 keyword search and
+# push real memories out of the top-N. We skip capturing those turns and
+# also filter such hits at recall time. Conservative patterns only: strong
+# miss-phrases, not every occurrence of e.g. "不知道" (which can appear in
+# genuinely informative answers).
+_NEGATIVE_MEMORY_RE = re.compile(
+    "|".join([
+        r"没有(任何|查到|找到|检索到|相关)?(的)?(记录|信息|结果|印象|线索)",
+        r"没有(任何)?关于",
+        r"没有任何.{0,16}(记录|信息|结果|印象|线索)",
+        r"查(询)?不到",
+        r"检索不到",
+        r"未找到(任何|相关)",
+        r"无(法)?(查|检)到",
+        r"(记忆|记录)中(没有|不)",
+        r"不(掌握|记得)",
+        r"没有关于",
+        r"\bno (record|records|information|results?)\b",
+        r"\bdon'?t (recall|have|know)\b",
+        r"\bnot (been )?(recorded|found)\b",
+        r"\b(i (do|did)n'?t|unable to) (find|recall)\b",
+    ]),
+    re.IGNORECASE,
+)
+
+
+def _is_negative_memory(text: str) -> bool:
+    """True if the text looks like a memory-lookup miss (not worth keeping)."""
+    if not text:
+        return False
+    # Match on the first 400 chars — miss replies lead with the disclaimer.
+    return bool(_NEGATIVE_MEMORY_RE.search(str(text)[:400]))
 
 
 def _env(key: str, default: str = "") -> str:
@@ -117,23 +153,32 @@ class TencentdbCloudProvider(MemoryProvider):
         results: Dict[str, str] = {}
         threads: List[threading.Thread] = []
 
-        def _section(key: str, fn, fmt) -> None:
+        def _section(key: str, fn, fmt, dedupe: bool = False) -> None:
             try:
                 res = fn()
                 items = self._items(res.get("data") or {}) if key != "core" else [res.get("data") or {}]
                 lines = [fmt(i) for i in items if fmt(i)]
+                if dedupe:
+                    seen = set()
+                    uniq = []
+                    for line in lines:
+                        k = line[:120].lower()
+                        if k not in seen:
+                            seen.add(k)
+                            uniq.append(line)
+                    lines = uniq
                 if lines:
                     results[key] = "\n".join(lines)
             except Exception as e:
                 logger.debug("tdam-cloud %s failed: %s", key, e)
 
         jobs = [
-            ("core", lambda: self._client._post("/v3/core/read", self._client._isolation(), timeout=5.5, retries=0), lambda i: str(i.get("content") or "")),
-            ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic),
-            ("conv", lambda: self._client._post("/v3/conversation/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_conv),
+            ("core", lambda: self._client._post("/v3/core/read", self._client._isolation(), timeout=5.5, retries=0), lambda i: str(i.get("content") or ""), False),
+            ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic, True),
+            ("conv", lambda: self._client._post("/v3/conversation/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_conv, True),
         ]
-        for key, fn, fmt in jobs:
-            t = threading.Thread(target=_section, args=(key, fn, fmt), daemon=True)
+        for key, fn, fmt, dq in jobs:
+            t = threading.Thread(target=_section, args=(key, fn, fmt, dq), daemon=True)
             t.start()
             threads.append(t)
         # Single shared deadline so the whole prefetch stays within
@@ -169,8 +214,9 @@ class TencentdbCloudProvider(MemoryProvider):
 
     @staticmethod
     def _fmt_conv(item: Dict[str, Any]) -> str:
+        """Format an L0 hit; returns "" for memory-miss entries (pollution)."""
         content = item.get("content") or ""
-        if not content:
+        if not content or _is_negative_memory(content):
             return ""
         role = item.get("role") or "msg"
         ts = item.get("timestamp") or item.get("created_at") or ""
@@ -188,6 +234,12 @@ class TencentdbCloudProvider(MemoryProvider):
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         if not self._client:
+            return
+        # Pollution guard: a "no record" reply carries nothing recallable and
+        # lexically overlaps with the question, so capturing the turn would
+        # push real memories out of keyword-search top-N later.
+        if _is_negative_memory(assistant_content):
+            logger.info("tdam-cloud skip capture (memory-miss reply): %.80s", assistant_content)
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         payload = {
@@ -271,6 +323,9 @@ class TencentdbCloudProvider(MemoryProvider):
         except Exception as e:
             return json.dumps({"error": str(e)})
         items = self._items(res.get("data") or {})
+        if tool_name == "tdai_conversation_search":
+            # drop memory-miss entries ("no record" replies) — pollution
+            items = [i for i in items if not _is_negative_memory(i.get("content") or "")]
         return json.dumps({"items": items, "total": len(items)}, ensure_ascii=False)
 
     # -- config -------------------------------------------------------------------
