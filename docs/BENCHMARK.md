@@ -165,6 +165,36 @@ MemoryManager 在硬退出前会等待后台 sync 任务 ≤5s,同步上传在�
 配合 #1 的同步上传,丢失窗口收敛为"进程被 SIGKILL 且 spool 写盘前"
 这一极小窗口。
 
+### 2.8 三层记忆内核测试(2026-09-01)
+
+测试脚本:`tests/three_layers_test.py`(可重复执行,自动生成唯一标记)。
+
+| 层 | 检查 | 结果 | 说明 |
+|---|---|---|---|
+| 短期 | L0 会话内写入/query | PASS | 385~1294ms |
+| 短期 | 跨轮 search 召回 | PASS | 90s 索引等待后命中 |
+| 短期 | session 隔离 | PASS | query 按 session 精确过滤 |
+| 长期 | L1 管线抽取(2 分钟观测窗) | PENDING | 抽取延迟 >2 分钟,更早轮次已产出 work_fact |
+| 长期 | L3 core/write + read 回读 | PASS | ~500ms |
+| 长期 | 跨会话召回(L0 search) | PASS | 5 hits |
+| 团队 | L0 跨 user 隔离(同 team) | ISOLATED | 不同 user 互不可见 |
+| 团队 | L1 跨 user 隔离(同 team) | ISOLATED | 不同 user 互不可见 |
+| 团队 | L3 跨 user(同 team) | **SHARED** | **平台语义:L3 是 (team, agent) 级共享画像** |
+| 团队 | Wiki 资产团队内跨 user 可见 | PASS | 团队资产不随 user 隔离 |
+| 团队 | Wiki 按团队列举/清理 | PASS | — |
+
+**关键语义发现(已用双盲 user 复核确认)**:
+
+1. **L3 core 的作用域是 (team, agent),不按 user 隔离**——同一 team+agent
+   下任何 user 读写的是同一份画像。它实际是"Agent 级共享画像":
+   - 适用:团队内该 Agent 需要统一记住的用户群特征(如项目约定)
+   - 注意:多用户共用同一 Agent 时,画像互相覆盖,不适合存个人隐私画像
+   - 插件影响:prefetch 注入的 `<core_memory>` 对所有用户相同
+2. **L1 抽取延迟是分钟级到更久**(RT1 轮次约 1 小时后才出现在 atomic),
+   依赖 L1 做实时召回不可靠,L0/L3 是召回主力(插件已按此设计)
+3. L0/L1 严格按 (team, agent, user) 隔离;跨 user 共享只能走
+   L3(画像)或 Wiki 资产(元数据)
+
 ## 3. 稳定性/缺陷发现
 
 | # | 现象 | 根因 | 处置 |
@@ -191,7 +221,9 @@ cp -r plugins/memory_tencentdb_cloud ~/.hermes/plugins/
 # 2. 按 docs/OPERATIONS.md §4 配置(两机同四元组)
 # 3. 四资产能力测试(自动建/清测试资产)
 python3 tests/four_assets_test.py
-# 4. 记忆 benchmark
+# 4. 三层记忆内核测试(短期/长期/团队,含索引等待约 5 分钟)
+python3 tests/three_layers_test.py
+# 5. 记忆 benchmark
 python3 tests/memory_benchmark.py --runs 6
-# 5. 跨机召回:两机分别执行 §2.2 的 A/B 步骤
+# 6. 跨机召回:两机分别执行 §2.2 的 A/B 步骤
 ```

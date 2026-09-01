@@ -135,7 +135,88 @@ curl -s -X POST "$ENDPOINT/v3/conversation/search" \
        "user_id":"user-hermes-v2","query":"幸运数字","limit":5}' | jq
 ```
 
-## 7. 日常运维
+## 7. 三层记忆模型与使用手册
+
+> 语义均经真实实例实测确认(测试脚本 `tests/three_layers_test.py`,
+> 结果详见 `docs/BENCHMARK.md` §2.8)。
+
+### 7.1 三层速查表
+
+| 层 | 数据面 | 作用域 | 插件如何用 | 适合记什么 |
+|---|---|---|---|---|
+| **短期记忆** | L0 conversation | (team, agent, user, **session**) | 每轮自动上报;召回时按当前 query 检索历史注入 `<related_conversations>`;提供 `tdai_conversation_search` 工具 | "刚才说过的话"、本次/近期会话细节 |
+| **长期记忆** | L1 atomic + L3 core | L1: (team, agent, user);**L3: (team, agent),团队内共享** | L1 由云端管线异步抽取(分钟级~小时级延迟);L3 画像注入 `<core_memory>`(所有用户相同);L1 有产物时自动提供 `tdai_memory_search` 工具 | 稳定的偏好、事实、约定(L1 自动抽 / L3 手动精修) |
+| **团队记忆** | 团队共享层 | (team) 级 | Wiki 知识资产(元数据 CRUD)不随 user 隔离,团队内共享 | 团队文档、共享约定(注:内容检索需自建 Knowledge Service) |
+
+隔离语义实测结论:
+
+- **L0 / L1**:严格按 (team, agent, user) 隔离——不同用户互不可见
+- **L3 core**:按 (team, agent) 共享——同团队同 Agent 的所有用户读写同一份画像
+- **Wiki/Knowledge**:按 team 共享的资产(元数据层)
+- 想给不同用户独立记忆:用不同 `TDAI_MEMORY_USER_ID`;想让团队共享画像:共用同一 agent_id 即可(L3 天然共享)
+
+### 7.2 日常使用(无需任何操作)
+
+插件自动完成全部三层读写:
+
+1. 每轮对话结束 → 自动上报 L0(失败自动落盘重试)
+2. 每轮对话开始 → 自动并行召回(L3 画像 + L1 结构化记忆 + L0 历史)注入上下文
+3. Agent 可按需调用搜索工具主动查记忆
+4. 云端管线异步把 L0 对话提炼为 L1 结构化记忆(自动)
+
+只需要记住两条:**问过的东西过几分钟就能被新会话想起**;
+**画像(L3)是全团队 Agent 共享的,别放私人信息**。
+
+### 7.3 手动管理各层(可选)
+
+```bash
+ENDPOINT=https://memory.ap-guangzhou.tencenttdai.com
+API_KEY=<实例 API Key>; INSTANCE_ID=mem-xxxxxxxx
+AUTH=(-H "Authorization: Bearer $API_KEY" -H "x-tdai-service-id: $INSTANCE_ID" -H "Content-Type: application/json")
+
+# ── 短期记忆(L0)─────────────────────────────
+# 查看某会话全部消息
+curl -s -X POST "$ENDPOINT/v3/conversation/query" "${AUTH[@]}" \
+  -d '{"team_id":"team-hermes-test","agent_id":"agent-hermes",
+       "user_id":"user-hermes-v2","session_id":"<会话ID>","limit":20}' | jq
+
+# 检索历史对话
+curl -s -X POST "$ENDPOINT/v3/conversation/search" "${AUTH[@]}" \
+  -d '{"team_id":"team-hermes-test","agent_id":"agent-hermes",
+       "user_id":"user-hermes-v2","query":"关键词","limit":5}' | jq
+
+# ── 长期记忆(L1 抽取产物)──────────────────────
+# 列出云端提炼出的结构化记忆
+curl -s -X POST "$ENDPOINT/v3/atomic/query" "${AUTH[@]}" \
+  -d '{"team_id":"team-hermes-test","agent_id":"agent-hermes",
+       "user_id":"user-hermes-v2","limit":20}' | jq
+
+# ── 长期记忆(L3 共享画像)──────────────────────
+# 读/写团队共享画像(注意:同 team+agent 的所有用户共用!)
+curl -s -X POST "$ENDPOINT/v3/core/read" "${AUTH[@]}" \
+  -d '{"team_id":"team-hermes-test","agent_id":"agent-hermes","user_id":"user-hermes-v2"}' | jq
+curl -s -X POST "$ENDPOINT/v3/core/write" "${AUTH[@]}" \
+  -d '{"team_id":"team-hermes-test","agent_id":"agent-hermes","user_id":"user-hermes-v2",
+       "content":"# 用户画像\n- 喜欢的编程语言: Rust\n"}' | jq
+
+# ── 团队记忆(Wiki 资产)──────────────────────
+# 创建团队知识源(元数据;内容检索需自建 Knowledge Service)
+curl -s -X POST "$ENDPOINT/v3/knowledge/create" "${AUTH[@]}" \
+  -d '{"knowledge_id":"team-wiki-1","type":"wiki","name":"团队 Wiki",
+       "service_url":"'"$ENDPOINT"'/v3","team_id":"team-hermes-test"}' | jq
+```
+
+### 7.4 三层相关注意事项
+
+- **短期**:检索索引异步,写入后 2~3 分钟才可召回;"查无记录"类回复
+  会被插件过滤,不会污染后续检索
+- **长期**:L1 抽取延迟大(分钟级~小时级),不要依赖它做实时召回;
+  L3 是团队共享的,写入前想清楚受众;`tdai_memory_search` 工具只在
+  L1 有产物时才会出现在 Agent 的工具列表里
+- **团队**:免费版 Wiki/CodeGraph 仅元数据 CRUD;内容级团队共享需要
+  付费版代理路由或自建 Knowledge Service
+
+## 8. 日常运维
 
 | 操作 | 命令/方式 |
 |---|---|
@@ -147,9 +228,9 @@ curl -s -X POST "$ENDPOINT/v3/conversation/search" \
 | 升级插件 | 覆盖 `~/.hermes/plugins/memory_tencentdb_cloud/` 后重启会话 |
 | 云端数据巡检 | 见 §6 的 curl 示例 |
 
-## 8. 排障
+## 9. 排障
 
-### 8.1 召回为空
+### 9.1 召回为空
 
 1. **索引延迟**:写入后 2~3 分钟内检索不到是正常现象,先等待
 2. **实例高负载**:免费版偶发 522/慢响应,prefetch 有 6.5s 硬时限,
@@ -158,7 +239,7 @@ curl -s -X POST "$ENDPOINT/v3/conversation/search" \
 4. **索引失效**:如果某隔离维度**批量删除过会话**,该维度检索可能永久
    失效(实测),换一个新的 `user_id` 即可恢复——**避免批量删除**
 
-### 8.2 capture 丢失
+### 9.2 capture 丢失
 
 - 上传失败(网络/5xx/超时/429)的轮次会持久化到
   `~/.hermes/tdam-cloud-spool/*.json`,下次会话 initialize 时自动重放
@@ -169,7 +250,7 @@ curl -s -X POST "$ENDPOINT/v3/conversation/search" \
   的退出 drain 预算放弃(少见;常态零丢失)
 - 验证方法:对话后用 §6 的 query 接口检查是否落库
 
-### 8.3 插件未被加载
+### 9.3 插件未被加载
 
 ```bash
 # 1) 确认目录与文件
@@ -183,7 +264,7 @@ grep -A1 "memory:" ~/.hermes/config.yaml
 hermes memory status
 ```
 
-### 8.4 HTTP 错误码
+### 9.4 HTTP 错误码
 
 | 码 | 含义 | 处理 |
 |---|---|---|
@@ -192,7 +273,7 @@ hermes memory status
 | 522 | 实例源站超时(免费版高负载) | 重试;插件已自动重试 5xx |
 | 5901 | proxy 服务免费版不可用 | 与本插件无关(本插件不走 proxy) |
 
-### 8.5 时间戳格式
+### 9.5 时间戳格式
 
 `conversation/add` 的 `messages[].timestamp` 只接受 **UTC `Z` 后缀**
 的 ISO 格式(如 `2026-08-30T14:00:00Z`);`+08:00` 或无时区格式会返回

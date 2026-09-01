@@ -46,10 +46,11 @@ hermes -z "我的幸运数字是多少?"
 ├── README.md
 ├── docs/
 │   ├── ARCHITECTURE.md      # 架构文档
-│   ├── OPERATIONS.md        # 操作文档(安装/配置/运维/排障)
-│   └── BENCHMARK.md         # 测试报告与基准数据
+│   ├── OPERATIONS.md        # 操作文档(安装/配置/三层记忆使用手册/运维/排障)
+│   └── BENCHMARK.md         # 测试报告与基准数据(含三层记忆语义实测)
 ├── tests/
 │   ├── four_assets_test.py  # 四资产能力测试(Chat Memory/Skill/Wiki/CodeGraph)
+│   ├── three_layers_test.py # 三层记忆内核测试(短期/长期/团队)
 │   └── memory_benchmark.py  # 记忆召回 benchmark(延迟/命中率/预算)
 └── plugins/memory_tencentdb_cloud/
     ├── __init__.py          # MemoryProvider 实现
