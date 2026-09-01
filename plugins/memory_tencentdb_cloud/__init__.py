@@ -87,6 +87,7 @@ class TencentdbCloudProvider(MemoryProvider):
         # would only waste tokens and mislead the model — it stays offline
         # until the probe finds actual L1 memories.
         self._l1_available = False
+        self._l1_probed = False
         self._hermes_home = ""
         self._spool_dir: Optional[str] = None
 
@@ -137,6 +138,7 @@ class TencentdbCloudProvider(MemoryProvider):
         )
         self._started = True
         self._l1_available = self._probe_l1()
+        self._l1_probed = True
         self._replay_spool(budget_s=12.0, max_items=8)
         logger.info(
             "memory_tencentdb_cloud initialized: endpoint=%s service=%s session=%s l1_tools=%s",
@@ -169,11 +171,27 @@ class TencentdbCloudProvider(MemoryProvider):
         results: Dict[str, str] = {}
         threads: List[threading.Thread] = []
 
-        def _section(key: str, fn, fmt, dedupe: bool = False) -> None:
+        def _section(key: str, fn, fmt, dedupe: bool = False,
+                     assistant_first: bool = False, max_lines: int = 0) -> None:
             try:
                 res = fn()
                 items = self._items(res.get("data") or {}) if key != "core" else [res.get("data") or {}]
-                lines = [fmt(i) for i in items if fmt(i)]
+                if assistant_first:
+                    # Lexical search ranks user questions (which echo the
+                    # query verbatim) above assistant answers that carry the
+                    # actual facts. Injecting assistant hits first raises the
+                    # fact density of the injected context.
+                    tmp = []
+                    for i in items:
+                        line = fmt(i)
+                        if line:
+                            role = (i.get("role") or "") if isinstance(i, dict) else ""
+                            tmp.append((line, role))
+                    asst = [l for l, _role in tmp if _role == "assistant"]
+                    other = [l for l, _role in tmp if _role != "assistant"]
+                    lines = asst + other
+                else:
+                    lines = [fmt(i) for i in items if fmt(i)]
                 if dedupe:
                     seen = set()
                     uniq = []
@@ -183,19 +201,22 @@ class TencentdbCloudProvider(MemoryProvider):
                             seen.add(k)
                             uniq.append(line)
                     lines = uniq
+                if max_lines and len(lines) > max_lines:
+                    lines = lines[:max_lines]
                 if lines:
                     results[key] = "\n".join(lines)
             except Exception as e:
-                logger.debug("tdam-cloud %s failed: %s", key, e)
+                logger.debug("tdam-cloud %s failed: %s", key, e, exc_info=True)
 
         jobs = [
-            ("core", lambda: self._client._post("/v3/core/read", self._client._isolation(), timeout=5.5, retries=0), lambda i: str(i.get("content") or ""), False),
-            ("conv", lambda: self._client._post("/v3/conversation/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_conv, True),
+            ("core", lambda: self._client._post("/v3/core/read", self._client._isolation(), timeout=5.5, retries=0), lambda i: str(i.get("content") or ""), False, False),
+            ("conv", lambda: self._client._post("/v3/conversation/search", {**self._client._isolation(), "query": query, "limit": 30}, timeout=5.5, retries=0), self._fmt_conv, True, True, 10),
         ]
         if self._l1_available:
-            jobs.insert(1, ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic, True))
-        for key, fn, fmt, dq in jobs:
-            t = threading.Thread(target=_section, args=(key, fn, fmt, dq), daemon=True)
+            jobs.insert(1, ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic, True, False))
+        for job in jobs:
+            key, fn, fmt, dq, af = job[0], job[1], job[2], job[3], job[4]
+            t = threading.Thread(target=_section, args=job, daemon=True)
             t.start()
             threads.append(t)
         # Single shared deadline so the whole prefetch stays within
@@ -363,7 +384,26 @@ class TencentdbCloudProvider(MemoryProvider):
 
     # -- tools --------------------------------------------------------------------
 
+    def _ensure_client(self) -> None:
+        """Build the client from env if not initialized yet.
+
+        Hermes registers provider tools BEFORE calling initialize()
+        (observed: 'registered (0 tools)' in agent.log), so
+        get_tool_schemas() must not depend on initialize() having run —
+        otherwise the search tools are never advertised at all.
+        """
+        if self._client is None and self.is_available():
+            self._client = TDAMCloudClient(
+                endpoint=_env("TDAI_MEMORY_ENDPOINT"),
+                api_key=_env("TDAI_MEMORY_API_KEY"),
+                service_id=_env("TDAI_MEMORY_INSTANCE_ID", "default"),
+                team_id=_env("TDAI_MEMORY_TEAM_ID", "team-default"),
+                agent_id=_env("TDAI_MEMORY_AGENT_ID", "agent-default"),
+                user_id=_env("TDAI_MEMORY_USER_ID", "user-default"),
+            )
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        self._ensure_client()
         if not self._client:
             return []
         schemas: List[Dict[str, Any]] = [
@@ -384,8 +424,10 @@ class TencentdbCloudProvider(MemoryProvider):
             },
         ]
         # L1 search is only worth advertising when the extraction pipeline
-        # actually produces memories (probe at initialize).
-        if self._l1_available:
+        # actually produces memories (probe at initialize). Before the probe
+        # has run (registration happens before initialize), advertise
+        # optimistically — handle_tool_call degrades to an empty result.
+        if self._l1_available or not self._l1_probed:
             schemas.insert(0, {
                 "name": "tdai_memory_search",
                 "description": (
