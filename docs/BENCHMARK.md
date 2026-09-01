@@ -18,7 +18,7 @@
 |------|------|-----------|-----------|
 | **Chat Memory** | L0 对话写入/查询/检索 | `/v3/conversation/add·query·search` | ✅ 全部可用 |
 | Chat Memory | L3 核心记忆写/读 | `/v3/core/write·read` | ✅ 可用(手动维护) |
-| Chat Memory | L1 结构化记忆抽取 | `/v3/atomic/search·query` | ⚠️ 接口可用,管线不产出 |
+| Chat Memory | L1 结构化记忆抽取 | `/v3/atomic/search·query` | ⚠️ 管线延迟产出:开通初期持续为空,2026-08-31 起开始产出(work_fact 等);插件已加**自适应门控**(initialize 时探测,L1 有产物才注册 `tdai_memory_search` 并启用 prefetch 的 atomic 路) |
 | Chat Memory | L2 场景块 | `/v3/scenario/ls·read·write` | ⚠️ 只能列举;write 不能创建文件(404) |
 | Chat Memory | 上下文 offload | `/v3/offload/*` | ❌ 未路由(404) |
 | **Skill** | 全生命周期 CRUD | `/v3/skill/create·get·get-by-name·list·search·files/*·delete` | ✅ **16 项接口全部可用** |
@@ -170,6 +170,7 @@ MemoryManager 在硬退出前会等待后台 sync 任务 ≤5s,同步上传在�
 | 4 | **批量删除会话后,该隔离维度新写入消息不再入检索索引** | 疑似免费版管线缺陷 | 换新 `user_id` 恢复;避免批量删除 |
 | 5 | 串行 prefetch 最坏 36s,超出 Hermes 8s 预算被静默跳过 | 云实例偶发 522/高延迟 | 三路并行 + 5.5s 单请求超时 + 6.5s 总 deadline |
 | 6 | daemon capture 线程在进程退出时可能丢尾部数据 | `-z` 退出路径不保证调用 shutdown() | ✅ **已修复**(2026-08-31):移除插件内第二层异步(queue+daemon worker),`sync_turn` 直接同步上传(4s 超时,单次)——MemoryManager 本身就在后台线程调 sync_turn 并在硬退出前有 ≤5s 的 executor drain,双重异步才是竞态根源。真机两轮连续 `-z` 末轮全部落库。**残余**:实例单请求延迟 >5s 时,末轮仍可能被 MemoryManager 的 drain 预算放弃(hermes 侧硬边界,常态 <1s 零丢失) |
+| 11 | L1 空转时 `tdai_memory_search` 工具仍注册给模型,永远返回空(浪费 token、误导模型) | 免费版抽取管线延迟产出 | ✅ **已修复**(2026-08-31):initialize 时探测 `/v3/atomic/query`(limit=1)——空则本会话不注册 L1 工具、prefetch 跳过 atomic 路(并行路 3→2);有产物自动恢复;探测瞬时失败保守视为可用。真机验证:工具按探测结果自动启停,L1 产出后模型可综合 L1+L0 召回 |
 | 7 | 失败回答("没有记录")也会被 capture,污染后续检索排序 | L0 全量上报 | ✅ **已修复**(2026-08-30):双层过滤——capture 侧跳过"记忆未命中"类回复(`_is_negative_memory`,中英文模式,保守不误杀);召回侧从 prefetch/tool 结果中剔除该类条目并按内容去重。实测:污染条目从召回中消失,正确记忆重新浮出 |
 | 8 | skill/create 报 `50001 agent_not_found` | agent 未在元数据面注册 | 见 §1 的 meta 面预置流程 |
 | 9 | meta 面 team/agent create 不接受自定义 ID | 服务端自动分配 team-…/agt-… | create 后取返回 ID 使用 |

@@ -3,8 +3,9 @@ Memory cloud instance (v3 data plane).
 
 Direct integration with a managed Agent Memory instance:
 - prefetch(): inject L1 atomic memories + L3 core memory + L0 history hits
-- sync_turn(): fire-and-forget L0 conversation capture (background thread)
-- tools: tdai_memory_search (L1), tdai_conversation_search (L0)
+- sync_turn(): inline L0 conversation capture (bounded ~4s, race-free)
+- tools: tdai_memory_search (L1, auto-offline when the extraction pipeline
+  has never produced memories — e.g. free edition), tdai_conversation_search (L0)
 
 Configuration via environment variables (put in $HERMES_HOME/.env):
   TDAI_MEMORY_ENDPOINT      e.g. https://memory.ap-guangzhou.tencenttdai.com
@@ -79,6 +80,11 @@ class TencentdbCloudProvider(MemoryProvider):
         self._client: Optional[TDAMCloudClient] = None
         self._session_id = ""
         self._started = False
+        # L1 atomic extraction productivity, probed at initialize(). On the
+        # free edition the pipeline never produces anything, so the L1 tool
+        # would only waste tokens and mislead the model — it stays offline
+        # until the probe finds actual L1 memories.
+        self._l1_available = False
 
     # -- properties / availability -------------------------------------------
 
@@ -91,6 +97,29 @@ class TencentdbCloudProvider(MemoryProvider):
 
     # -- lifecycle -------------------------------------------------------------
 
+    def _probe_l1(self) -> bool:
+        """True if the instance has any L1 atomic memories.
+
+        Probe failure (network/5xx) counts as available — transient errors
+        must not permanently hide the tool; an empty answer is the
+        deterministic "extraction pipeline idle" signal.
+        """
+        try:
+            raw = self._client._post(
+                "/v3/atomic/query",
+                {**self._client._isolation(), "limit": 1},
+                timeout=3.5,
+                retries=0,
+            )
+            items = self._items(raw.get("data") or {}) if raw.get("code") == 0 else None
+            if items is None:
+                logger.warning("tdam-cloud L1 probe failed (code=%s); assuming available", raw.get("code"))
+                return True
+            return len(items) > 0
+        except Exception as e:
+            logger.warning("tdam-cloud L1 probe error (%s); assuming available", e)
+            return True
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or "default"
         self._client = TDAMCloudClient(
@@ -102,9 +131,11 @@ class TencentdbCloudProvider(MemoryProvider):
             user_id=_env("TDAI_MEMORY_USER_ID", "user-default"),
         )
         self._started = True
+        self._l1_available = self._probe_l1()
         logger.info(
-            "memory_tencentdb_cloud initialized: endpoint=%s service=%s session=%s",
-            _env("TDAI_MEMORY_ENDPOINT"), _env("TDAI_MEMORY_INSTANCE_ID"), self._session_id,
+            "memory_tencentdb_cloud initialized: endpoint=%s service=%s session=%s l1_tools=%s",
+            _env("TDAI_MEMORY_ENDPOINT"), _env("TDAI_MEMORY_INSTANCE_ID"),
+            self._session_id, "on" if self._l1_available else "off (no L1 memories)",
         )
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
@@ -153,9 +184,10 @@ class TencentdbCloudProvider(MemoryProvider):
 
         jobs = [
             ("core", lambda: self._client._post("/v3/core/read", self._client._isolation(), timeout=5.5, retries=0), lambda i: str(i.get("content") or ""), False),
-            ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic, True),
             ("conv", lambda: self._client._post("/v3/conversation/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_conv, True),
         ]
+        if self._l1_available:
+            jobs.insert(1, ("atomic", lambda: self._client._post("/v3/atomic/search", {**self._client._isolation(), "query": query, "limit": 8}, timeout=5.5, retries=0), self._fmt_atomic, True))
         for key, fn, fmt, dq in jobs:
             t = threading.Thread(target=_section, args=(key, fn, fmt, dq), daemon=True)
             t.start()
@@ -247,22 +279,7 @@ class TencentdbCloudProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if not self._client:
             return []
-        return [
-            {
-                "name": "tdai_memory_search",
-                "description": (
-                    "Search the user's structured long-term memories (preferences, "
-                    "facts, decisions, instructions) stored in TencentDB Agent Memory."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "What to search for."},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default 5)."},
-                    },
-                    "required": ["query"],
-                },
-            },
+        schemas: List[Dict[str, Any]] = [
             {
                 "name": "tdai_conversation_search",
                 "description": (
@@ -279,6 +296,25 @@ class TencentdbCloudProvider(MemoryProvider):
                 },
             },
         ]
+        # L1 search is only worth advertising when the extraction pipeline
+        # actually produces memories (probe at initialize).
+        if self._l1_available:
+            schemas.insert(0, {
+                "name": "tdai_memory_search",
+                "description": (
+                    "Search the user's structured long-term memories (preferences, "
+                    "facts, decisions, instructions) stored in TencentDB Agent Memory."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to search for."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default 5)."},
+                    },
+                    "required": ["query"],
+                },
+            })
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._client:
