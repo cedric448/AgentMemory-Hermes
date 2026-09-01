@@ -47,7 +47,8 @@ hermes -z "我的幸运数字是多少?"
 ├── docs/
 │   ├── ARCHITECTURE.md      # 架构文档
 │   ├── OPERATIONS.md        # 操作文档(安装/配置/三层记忆使用手册/运维/排障)
-│   └── BENCHMARK.md         # 测试报告与基准数据(含三层记忆语义实测)
+│   ├── BENCHMARK.md         # 测试报告与基准数据(含三层记忆语义实测)
+│   └── TESTING_LOG.md       # 测试过程记录(时间线/踩坑/缺陷修复闭环)
 ├── tests/
 │   ├── four_assets_test.py  # 四资产能力测试(Chat Memory/Skill/Wiki/CodeGraph)
 │   ├── three_layers_test.py # 三层记忆内核测试(短期/长期/团队)
