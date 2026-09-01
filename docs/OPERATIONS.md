@@ -160,8 +160,13 @@ curl -s -X POST "$ENDPOINT/v3/conversation/search" \
 
 ### 8.2 capture 丢失
 
-- `hermes -z` 一次性模式进程退出较快,最后一轮可能未上报(已知残留问题)
-- 交互式 `hermes` 不受影响
+- 上传失败(网络/5xx/超时/429)的轮次会持久化到
+  `~/.hermes/tdam-cloud-spool/*.json`,下次会话 initialize 时自动重放
+  (有界:≤12s / ≤8 条,遇到失败即停,下个会话继续)
+- 4xx 永久错误(除 429)不重试,直接丢弃并记日志
+- spool 目录超过 200 条会丢弃最旧(实例长期不可用时兜底)
+- `hermes -z` 模式下,实例单请求延迟 >5s 时末轮可能被 MemoryManager
+  的退出 drain 预算放弃(少见;常态零丢失)
 - 验证方法:对话后用 §6 的 query 接口检查是否落库
 
 ### 8.3 插件未被加载

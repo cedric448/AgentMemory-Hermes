@@ -18,12 +18,14 @@ Configuration via environment variables (put in $HERMES_HOME/.env):
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import re
 import threading
 import time
+import urllib.error
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -85,6 +87,8 @@ class TencentdbCloudProvider(MemoryProvider):
         # would only waste tokens and mislead the model — it stays offline
         # until the probe finds actual L1 memories.
         self._l1_available = False
+        self._hermes_home = ""
+        self._spool_dir: Optional[str] = None
 
     # -- properties / availability -------------------------------------------
 
@@ -122,6 +126,7 @@ class TencentdbCloudProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or "default"
+        self._hermes_home = str(kwargs.get("hermes_home") or "") or os.path.expanduser("~/.hermes")
         self._client = TDAMCloudClient(
             endpoint=_env("TDAI_MEMORY_ENDPOINT"),
             api_key=_env("TDAI_MEMORY_API_KEY"),
@@ -132,6 +137,7 @@ class TencentdbCloudProvider(MemoryProvider):
         )
         self._started = True
         self._l1_available = self._probe_l1()
+        self._replay_spool(budget_s=12.0, max_items=8)
         logger.info(
             "memory_tencentdb_cloud initialized: endpoint=%s service=%s session=%s l1_tools=%s",
             _env("TDAI_MEMORY_ENDPOINT"), _env("TDAI_MEMORY_INSTANCE_ID"),
@@ -236,6 +242,77 @@ class TencentdbCloudProvider(MemoryProvider):
 
     # -- capture -----------------------------------------------------------------
 
+    _SPOOL_MAX_FILES = 200
+
+    def _get_spool_dir(self) -> str:
+        if not self._spool_dir:
+            self._spool_dir = os.path.join(self._hermes_home, "tdam-cloud-spool")
+            os.makedirs(self._spool_dir, exist_ok=True)
+        return self._spool_dir
+
+    def _spool(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Persist a failed turn for replay at next initialize (best effort)."""
+        try:
+            d = self._get_spool_dir()
+            name = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{int(time.time()*1000)%1000000}.json"
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                json.dump({"session_id": session_id, "messages": messages}, f, ensure_ascii=False)
+            # cap growth: if the instance is down for days, drop the oldest
+            try:
+                files = sorted(glob.glob(os.path.join(d, "*.json")))
+                for old in files[: max(0, len(files) - self._SPOOL_MAX_FILES)]:
+                    os.remove(old)
+                if len(files) > self._SPOOL_MAX_FILES:
+                    logger.warning("tdam-cloud spool overflow: dropped %d oldest turns", len(files) - self._SPOOL_MAX_FILES)
+            except Exception:
+                pass
+            logger.warning("tdam-cloud turn spooled for retry: %s", name)
+        except Exception as e:
+            logger.error("tdam-cloud spool write failed; turn lost: %s", e)
+
+    def _replay_spool(self, budget_s: float, max_items: int) -> None:
+        """Best-effort replay of spooled turns. Bounded: stops on the first
+        failure (instance likely still down), on budget, or on max_items.
+        Permanent 4xx failures are dropped (they can never succeed)."""
+        try:
+            files = sorted(glob.glob(os.path.join(self._get_spool_dir(), "*.json")))
+        except Exception:
+            return
+        if not files:
+            return
+        replayed = dropped = 0
+        deadline = time.time() + budget_s
+        for path in files[:max_items]:
+            if time.time() >= deadline:
+                return
+            try:
+                with open(path, encoding="utf-8") as f:
+                    entry = json.load(f)
+            except Exception:
+                os.remove(path)  # corrupt beyond repair
+                dropped += 1
+                continue
+            try:
+                self._client.conversation_add(
+                    entry["messages"], session_id=entry["session_id"], timeout=4, retries=0
+                )
+                os.remove(path)
+                replayed += 1
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500 and e.code != 429:
+                    logger.warning("tdam-cloud spool replay dropped (HTTP %d, permanent): %s", e.code, path)
+                    os.remove(path)
+                    dropped += 1
+                else:
+                    logger.warning("tdam-cloud spool replay paused (HTTP %d); will retry next session", e.code)
+                    return
+            except Exception as e:
+                logger.warning("tdam-cloud spool replay paused (%s); will retry next session", e)
+                return
+        if replayed or dropped:
+            logger.info("tdam-cloud spool replay: %d replayed, %d dropped, %d remain",
+                        replayed, dropped, len(files) - replayed - dropped)
+
     def sync_turn(
         self,
         user_content: str,
@@ -251,6 +328,8 @@ class TencentdbCloudProvider(MemoryProvider):
         before hard-exiting one-shot runs — so uploading inline here is
         race-free. A second async layer (internal queue + worker) was
         tried and caused tail-turn loss on os._exit paths.
+        Failed uploads (network/5xx/timeout/429) are spooled to
+        $HERMES_HOME/tdam-cloud-spool/ and replayed at next initialize.
         """
         if not self._client:
             return
@@ -261,18 +340,26 @@ class TencentdbCloudProvider(MemoryProvider):
             logger.info("tdam-cloud skip capture (memory-miss reply): %.80s", assistant_content)
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        msgs = [
+            {"role": "user", "content": user_content, "timestamp": now},
+            {"role": "assistant", "content": assistant_content, "timestamp": now},
+        ]
         try:
             self._client.conversation_add(
-                [
-                    {"role": "user", "content": user_content, "timestamp": now},
-                    {"role": "assistant", "content": assistant_content, "timestamp": now},
-                ],
+                msgs,
                 session_id=session_id or self._session_id,
                 timeout=4,
                 retries=0,
             )
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 and e.code != 429:
+                logger.warning("tdam-cloud conversation_add permanent failure (HTTP %d); turn dropped", e.code)
+                return
+            logger.warning("tdam-cloud conversation_add failed (HTTP %d); spooling", e.code)
+            self._spool(session_id or self._session_id, msgs)
         except Exception as e:
-            logger.warning("tdam-cloud conversation_add failed: %s", e)
+            logger.warning("tdam-cloud conversation_add failed (%s); spooling", e)
+            self._spool(session_id or self._session_id, msgs)
 
     # -- tools --------------------------------------------------------------------
 
